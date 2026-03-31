@@ -48,9 +48,14 @@ jobs:
           fi
 
           # Request a GitHub OIDC token for AWS STS
-          oidc_token=$(curl -sS \
+          oidc_response=$(curl -sS -f \
             -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
-            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com" | jq -r '.value')
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com")
+          oidc_token=$(echo "${oidc_response}" | jq -r '.value')
+          if [[ -z "${oidc_token}" || "${oidc_token}" == "null" ]]; then
+            echo "::error::Failed to obtain GitHub OIDC token"
+            exit 1
+          fi
 
           for stack in "${stacks[@]}"; do
             echo "::group::${stack}"

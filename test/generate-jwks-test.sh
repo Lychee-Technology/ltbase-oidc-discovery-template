@@ -44,7 +44,7 @@ fi
 
 # --- Test 2: required JWKS fields present with correct values ---
 
-python3 - "${test_key_id}" "${expected_modulus_hex}" <<'PYEOF' <<<"${output}"
+if ! python3 - "${test_key_id}" "${expected_modulus_hex}" <<'PYEOF' <<<"${output}"
 import json, sys, base64
 
 jwks = json.load(sys.stdin)
@@ -75,8 +75,7 @@ assert n_hex == expected_hex.upper(), (
     f"modulus mismatch:\n  got:      {n_hex[:40]}...\n  expected: {expected_hex[:40]}..."
 )
 PYEOF
-
-if [[ $? -ne 0 ]]; then
+then
   fail "field validation failed"
 fi
 
