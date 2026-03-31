@@ -1,0 +1,121 @@
+name: Publish OIDC Discovery Documents
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_stack:
+        description: "Stack to publish ('all' or a specific stack name)"
+        required: false
+        default: "all"
+        type: string
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate discovery documents
+        env:
+          OIDC_DISCOVERY_DOMAIN: ${{ vars.OIDC_DISCOVERY_DOMAIN }}
+          OIDC_DISCOVERY_STACK_CONFIG: ${{ vars.OIDC_DISCOVERY_STACK_CONFIG }}
+          TARGET_STACK: ${{ inputs.target_stack }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${OIDC_DISCOVERY_DOMAIN}" ]]; then
+            echo "::error::OIDC_DISCOVERY_DOMAIN repo variable is not set"
+            exit 1
+          fi
+          if [[ -z "${OIDC_DISCOVERY_STACK_CONFIG}" ]]; then
+            echo "::error::OIDC_DISCOVERY_STACK_CONFIG repo variable is not set"
+            exit 1
+          fi
+
+          # Determine which stacks to process
+          if [[ "${TARGET_STACK}" == "all" ]]; then
+            mapfile -t stacks < <(echo "${OIDC_DISCOVERY_STACK_CONFIG}" | jq -r 'keys[]')
+          else
+            if ! echo "${OIDC_DISCOVERY_STACK_CONFIG}" | jq -e --arg s "${TARGET_STACK}" '.[$s]' >/dev/null 2>&1; then
+              echo "::error::Stack '${TARGET_STACK}' not found in OIDC_DISCOVERY_STACK_CONFIG"
+              exit 1
+            fi
+            stacks=("${TARGET_STACK}")
+          fi
+
+          # Request a GitHub OIDC token for AWS STS
+          oidc_token=$(curl -sS \
+            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com" | jq -r '.value')
+
+          for stack in "${stacks[@]}"; do
+            echo "::group::${stack}"
+
+            aws_region=$(echo "${OIDC_DISCOVERY_STACK_CONFIG}" | jq -r --arg s "${stack}" '.[$s].aws_region')
+            aws_role_arn=$(echo "${OIDC_DISCOVERY_STACK_CONFIG}" | jq -r --arg s "${stack}" '.[$s].aws_role_arn')
+            kms_alias=$(echo "${OIDC_DISCOVERY_STACK_CONFIG}" | jq -r --arg s "${stack}" '.[$s].kms_auth_key_alias')
+
+            # Assume the stack's IAM role via OIDC federation
+            creds=$(AWS_DEFAULT_REGION="${aws_region}" aws sts assume-role-with-web-identity \
+              --role-arn "${aws_role_arn}" \
+              --role-session-name "oidc-discovery-${stack}" \
+              --web-identity-token "${oidc_token}" \
+              --duration-seconds 900 \
+              --output json)
+
+            export AWS_ACCESS_KEY_ID=$(echo "${creds}" | jq -r '.Credentials.AccessKeyId')
+            export AWS_SECRET_ACCESS_KEY=$(echo "${creds}" | jq -r '.Credentials.SecretAccessKey')
+            export AWS_SESSION_TOKEN=$(echo "${creds}" | jq -r '.Credentials.SessionToken')
+            export AWS_DEFAULT_REGION="${aws_region}"
+
+            # Fetch the RSA public key from KMS
+            public_key_json=$(aws kms get-public-key --key-id "${kms_alias}" --output json)
+            public_key_b64=$(echo "${public_key_json}" | jq -r '.PublicKey')
+            key_id=$(echo "${public_key_json}" | jq -r '.KeyId')
+
+            # Generate JWKS
+            mkdir -p "${stack}/.well-known"
+            python3 scripts/generate-jwks.py \
+              --public-key-b64 "${public_key_b64}" \
+              --key-id "${key_id}" \
+              > "${stack}/.well-known/jwks.json"
+
+            # Generate openid-configuration
+            python3 -c "
+          import json, sys
+          domain = sys.argv[1]
+          stack = sys.argv[2]
+          print(json.dumps({
+              'issuer': f'https://{domain}/{stack}',
+              'jwks_uri': f'https://{domain}/{stack}/.well-known/jwks.json',
+              'response_types_supported': ['id_token'],
+              'subject_types_supported': ['public'],
+              'id_token_signing_alg_values_supported': ['RS256'],
+          }, indent=2))" "${OIDC_DISCOVERY_DOMAIN}" "${stack}" \
+              > "${stack}/.well-known/openid-configuration"
+
+            echo "Published: ${stack}/.well-known/jwks.json"
+            echo "Published: ${stack}/.well-known/openid-configuration"
+
+            # Clear credentials before next iteration
+            unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_DEFAULT_REGION
+
+            echo "::endgroup::"
+          done
+
+      - name: Commit and push
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          git commit -m "chore: update OIDC discovery documents"
+          git push
