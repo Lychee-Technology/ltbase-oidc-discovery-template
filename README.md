@@ -1,0 +1,1 @@
+# ltbase-oidc-discovery-template
