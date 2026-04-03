@@ -1,0 +1,110 @@
+name: Publish OIDC Discovery
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_stack:
+        description: Stack to publish, or all
+        required: true
+        default: all
+        type: string
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      stacks_json: ${{ steps.plan.outputs.stacks_json }}
+    env:
+      OIDC_DISCOVERY_STACK_CONFIG: ${{ vars.OIDC_DISCOVERY_STACK_CONFIG }}
+    steps:
+      - id: plan
+        shell: bash
+        run: |
+          target_stack='${{ inputs.target_stack }}'
+          if [[ -z "${OIDC_DISCOVERY_STACK_CONFIG}" ]]; then
+            echo "OIDC_DISCOVERY_STACK_CONFIG repo variable is required" >&2
+            exit 1
+          fi
+          if [[ "${target_stack}" == "all" ]]; then
+            stacks_json="$(jq -c 'keys' <<<"${OIDC_DISCOVERY_STACK_CONFIG}")"
+          else
+            stacks_json="$(jq -cn --arg stack "${target_stack}" '[ $stack ]')"
+          fi
+          echo "stacks_json=${stacks_json}" >>"$GITHUB_OUTPUT"
+
+  render:
+    needs: plan
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        stack: ${{ fromJson(needs.plan.outputs.stacks_json) }}
+    env:
+      OIDC_DISCOVERY_DOMAIN: ${{ vars.OIDC_DISCOVERY_DOMAIN }}
+      OIDC_DISCOVERY_STACK_CONFIG: ${{ vars.OIDC_DISCOVERY_STACK_CONFIG }}
+    steps:
+      - uses: actions/checkout@v6
+      - id: config
+        shell: bash
+        run: |
+          stack='${{ matrix.stack }}'
+          aws_region="$(jq -r --arg stack "${stack}" '.[$stack].aws_region // empty' <<<"${OIDC_DISCOVERY_STACK_CONFIG}")"
+          aws_role_arn="$(jq -r --arg stack "${stack}" '.[$stack].aws_role_arn // empty' <<<"${OIDC_DISCOVERY_STACK_CONFIG}")"
+          if [[ -z "${aws_region}" || -z "${aws_role_arn}" ]]; then
+            echo "missing stack configuration for ${stack}" >&2
+            exit 1
+          fi
+          echo "aws_region=${aws_region}" >>"$GITHUB_OUTPUT"
+          echo "aws_role_arn=${aws_role_arn}" >>"$GITHUB_OUTPUT"
+      - uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ steps.config.outputs.aws_role_arn }}
+          aws-region: ${{ steps.config.outputs.aws_region }}
+      - name: Render discovery files
+        shell: bash
+        run: |
+          mkdir -p rendered
+          ./scripts/render-discovery.sh \
+            --stack '${{ matrix.stack }}' \
+            --issuer-domain "${OIDC_DISCOVERY_DOMAIN}" \
+            --aws-region '${{ steps.config.outputs.aws_region }}' \
+            --kms-key-id "alias/ltbase-infra-${{ matrix.stack }}-authservice" \
+            --output-dir rendered
+      - uses: actions/upload-artifact@v4
+        with:
+          name: discovery-${{ matrix.stack }}
+          path: rendered/${{ matrix.stack }}
+
+  publish:
+    needs: render
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Merge rendered discovery documents
+        shell: bash
+        run: |
+          find artifacts -mindepth 2 -maxdepth 2 -type d | while read -r stack_dir; do
+            stack_name="$(basename "${stack_dir}")"
+            rm -rf "${stack_name}"
+            mkdir -p "${stack_name}"
+            cp -R "${stack_dir}/." "${stack_name}/"
+          done
+      - name: Commit published discovery documents
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .
+          if git diff --cached --quiet; then
+            echo "no changes to publish"
+            exit 0
+          fi
+          git commit -m "chore: publish oidc discovery documents"
+          git push
