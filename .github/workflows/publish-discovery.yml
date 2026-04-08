@@ -229,6 +229,15 @@ jobs:
             cp -R "${stack_dir}" "${site_dir}/"
           done < "${current_stack_manifest}"
 
+          if [[ -s "${current_stack_manifest}" ]]; then
+            headers_file="${site_dir}/_headers"
+            : > "${headers_file}"
+            while IFS= read -r stack_dir; do
+              [[ -n "${stack_dir}" ]] || continue
+              printf '/%s/.well-known/openid-configuration\n  Content-Type: application/json; charset=utf-8\n\n/%s/.well-known/jwks.json\n  Content-Type: application/json; charset=utf-8\n\n' "${stack_dir}" "${stack_dir}" >> "${headers_file}"
+            done < "${current_stack_manifest}"
+          fi
+
           if [[ ! -s "${current_stack_manifest}" && -s "${removed_stack_manifest}" ]]; then
             placeholder_file="${site_dir}/.pages-placeholder"
             : > "${placeholder_file}"
