@@ -13,11 +13,20 @@ permissions:
   contents: write
   id-token: write
 
+concurrency:
+  group: ${{ github.repository }}-${{ github.workflow }}
+  cancel-in-progress: false
+
 jobs:
   publish:
     runs-on: ubuntu-latest
+    env:
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      PAGES_DEPLOY_BRANCH: ${{ vars.OIDC_DISCOVERY_PAGES_BRANCH || github.event.repository.default_branch }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.DEFAULT_BRANCH }}
 
       - name: Generate discovery documents
         env:
@@ -27,12 +36,21 @@ jobs:
         run: |
           set -euo pipefail
 
+          current_stack_manifest="${RUNNER_TEMP}/oidc-current-stack-dirs.txt"
+          removed_stack_manifest="${RUNNER_TEMP}/oidc-removed-stack-dirs.txt"
+          : > "${current_stack_manifest}"
+          : > "${removed_stack_manifest}"
+
           if [[ -z "${OIDC_DISCOVERY_DOMAIN}" ]]; then
             echo "::error::OIDC_DISCOVERY_DOMAIN repo variable is not set"
             exit 1
           fi
           if [[ -z "${OIDC_DISCOVERY_STACK_CONFIG}" ]]; then
             echo "::error::OIDC_DISCOVERY_STACK_CONFIG repo variable is not set"
+            exit 1
+          fi
+          if ! echo "${OIDC_DISCOVERY_STACK_CONFIG}" | jq -e 'type == "object"' >/dev/null; then
+            echo "::error::OIDC_DISCOVERY_STACK_CONFIG must be a valid JSON object"
             exit 1
           fi
 
@@ -47,14 +65,28 @@ jobs:
             stacks=("${TARGET_STACK}")
           fi
 
-          # Request a GitHub OIDC token for AWS STS
-          oidc_response=$(curl -sS -f \
-            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
-            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com")
-          oidc_token=$(echo "${oidc_response}" | jq -r '.value')
-          if [[ -z "${oidc_token}" || "${oidc_token}" == "null" ]]; then
-            echo "::error::Failed to obtain GitHub OIDC token"
-            exit 1
+          for stack in "${stacks[@]}"; do
+            if [[ ! "${stack}" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+              echo "::error::Invalid stack name '${stack}' in OIDC_DISCOVERY_STACK_CONFIG"
+              exit 1
+            fi
+          done
+
+          if [[ "${TARGET_STACK}" == "all" ]]; then
+            declare -A configured_stacks=()
+            for stack in "${stacks[@]}"; do
+              configured_stacks["${stack}"]=1
+            done
+
+            shopt -s nullglob
+            for stack_dir in */; do
+              stack_dir=${stack_dir%/}
+              if [[ -f "${stack_dir}/.well-known/openid-configuration" && -f "${stack_dir}/.well-known/jwks.json" ]] && [[ -z "${configured_stacks["${stack_dir}"]+x}" ]]; then
+                rm -rf "${stack_dir}"
+                printf '%s\n' "${stack_dir}" >> "${removed_stack_manifest}"
+                echo "Removed stale stack: ${stack_dir}"
+              fi
+            done
           fi
 
           for stack in "${stacks[@]}"; do
@@ -63,6 +95,16 @@ jobs:
             aws_region=$(echo "${OIDC_DISCOVERY_STACK_CONFIG}" | jq -r --arg s "${stack}" '.[$s].aws_region')
             aws_role_arn=$(echo "${OIDC_DISCOVERY_STACK_CONFIG}" | jq -r --arg s "${stack}" '.[$s].aws_role_arn')
             kms_alias=$(echo "${OIDC_DISCOVERY_STACK_CONFIG}" | jq -r --arg s "${stack}" '.[$s].kms_auth_key_alias')
+
+            # Request a fresh GitHub OIDC token for each AWS STS exchange
+            oidc_response=$(curl -sS -f \
+              -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+              "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com")
+            oidc_token=$(echo "${oidc_response}" | jq -r '.value')
+            if [[ -z "${oidc_token}" || "${oidc_token}" == "null" ]]; then
+              echo "::error::Failed to obtain GitHub OIDC token"
+              exit 1
+            fi
 
             # Assume the stack's IAM role via OIDC federation
             creds=$(AWS_DEFAULT_REGION="${aws_region}" aws sts assume-role-with-web-identity \
@@ -112,15 +154,109 @@ jobs:
             echo "::endgroup::"
           done
 
-      - name: Commit and push
+          shopt -s nullglob
+          for stack_dir in */; do
+            stack_dir=${stack_dir%/}
+            if [[ -f "${stack_dir}/.well-known/openid-configuration" && -f "${stack_dir}/.well-known/jwks.json" ]]; then
+              printf '%s\n' "${stack_dir}" >> "${current_stack_manifest}"
+            fi
+          done
+
+      - name: Commit discovery docs
+        id: commit_discovery
         run: |
           set -euo pipefail
+          current_stack_manifest="${RUNNER_TEMP}/oidc-current-stack-dirs.txt"
+          removed_stack_manifest="${RUNNER_TEMP}/oidc-removed-stack-dirs.txt"
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A
+
+          while IFS= read -r stack_dir; do
+            [[ -n "${stack_dir}" ]] || continue
+            git add -A -- "${stack_dir}"
+          done < "${current_stack_manifest}"
+
+          while IFS= read -r stack_dir; do
+            [[ -n "${stack_dir}" ]] || continue
+            git add -A -- "${stack_dir}"
+          done < "${removed_stack_manifest}"
+
           if git diff --cached --quiet; then
             echo "No changes to commit"
+            echo "committed=false" >> "${GITHUB_OUTPUT}"
             exit 0
           fi
           git commit -m "chore: update OIDC discovery documents"
-          git push
+          local_commit_sha=$(git rev-parse HEAD)
+          git fetch origin "${DEFAULT_BRANCH}"
+          git checkout -B "${DEFAULT_BRANCH}" "origin/${DEFAULT_BRANCH}"
+          git cherry-pick "${local_commit_sha}"
+          commit_sha=$(git rev-parse HEAD)
+          git push origin HEAD:${DEFAULT_BRANCH}
+          echo "committed=true" >> "${GITHUB_OUTPUT}"
+          echo "commit_sha=${commit_sha}" >> "${GITHUB_OUTPUT}"
+
+      - name: Deploy to Cloudflare Pages
+        id: deploy_pages
+        timeout-minutes: 10
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          OIDC_DISCOVERY_PAGES_PROJECT: ${{ vars.OIDC_DISCOVERY_PAGES_PROJECT }}
+        run: |
+          set -euo pipefail
+
+          current_stack_manifest="${RUNNER_TEMP}/oidc-current-stack-dirs.txt"
+          removed_stack_manifest="${RUNNER_TEMP}/oidc-removed-stack-dirs.txt"
+          site_dir=$(mktemp -d)
+
+          if [[ -z "${CLOUDFLARE_API_TOKEN}" ]]; then
+            echo "::error::CLOUDFLARE_API_TOKEN repo secret is not set"
+            exit 1
+          fi
+          if [[ -z "${CLOUDFLARE_ACCOUNT_ID}" ]]; then
+            echo "::error::CLOUDFLARE_ACCOUNT_ID repo variable is not set"
+            exit 1
+          fi
+          if [[ -z "${OIDC_DISCOVERY_PAGES_PROJECT}" ]]; then
+            echo "::error::OIDC_DISCOVERY_PAGES_PROJECT repo variable is not set"
+            exit 1
+          fi
+
+          while IFS= read -r stack_dir; do
+            [[ -n "${stack_dir}" ]] || continue
+            cp -R "${stack_dir}" "${site_dir}/"
+          done < "${current_stack_manifest}"
+
+          if [[ ! -s "${current_stack_manifest}" && -s "${removed_stack_manifest}" ]]; then
+            placeholder_file="${site_dir}/.pages-placeholder"
+            : > "${placeholder_file}"
+          fi
+
+          if [[ -z "$(ls -A "${site_dir}")" ]]; then
+            echo "::error::No generated stack content found to deploy"
+            exit 1
+          fi
+
+          npm install --global wrangler@3.114.17
+          wrangler pages deploy "${site_dir}" --project-name "${OIDC_DISCOVERY_PAGES_PROJECT}" --branch "${PAGES_DEPLOY_BRANCH}"
+
+      - name: Revert pushed discovery docs on deploy failure
+        if: ${{ failure() && steps.commit_discovery.outputs.committed == 'true' && steps.deploy_pages.outcome == 'failure' }}
+        run: |
+          set -euo pipefail
+          commit_sha="${{ steps.commit_discovery.outputs.commit_sha }}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin "${DEFAULT_BRANCH}"
+          git checkout -B "${DEFAULT_BRANCH}" "origin/${DEFAULT_BRANCH}"
+
+          if ! git merge-base --is-ancestor "${commit_sha}" HEAD; then
+            echo "::error::Pushed discovery commit ${commit_sha} is no longer reachable from origin/${DEFAULT_BRANCH}; cannot auto-revert"
+            exit 1
+          fi
+
+          git revert --no-edit "${commit_sha}"
+          git push origin HEAD:${DEFAULT_BRANCH}
