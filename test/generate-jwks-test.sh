@@ -44,11 +44,13 @@ fi
 
 # --- Test 2: required JWKS fields present with correct values ---
 
-if ! python3 - "${test_key_id}" "${expected_modulus_hex}" <<'PYEOF' <<<"${output}"
+expected_kid="${test_key_id##*/key/}"
+
+if ! python3 - "${expected_kid}" "${expected_modulus_hex}" <<'PYEOF' <<<"${output}"
 import json, sys, base64
 
 jwks = json.load(sys.stdin)
-key_id = sys.argv[1]
+expected_kid = sys.argv[1]
 expected_hex = sys.argv[2]
 
 assert "keys" in jwks, "missing 'keys'"
@@ -59,7 +61,7 @@ k = jwks["keys"][0]
 assert k["kty"] == "RSA", f"kty={k['kty']}"
 assert k["alg"] == "RS256", f"alg={k['alg']}"
 assert k["use"] == "sig", f"use={k['use']}"
-assert k["kid"] == key_id, f"kid={k['kid']}"
+assert k["kid"] == expected_kid, f"kid={k['kid']}"
 
 for field in ("n", "e"):
     v = k[field]

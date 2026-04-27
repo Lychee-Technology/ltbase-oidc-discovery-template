@@ -8,7 +8,16 @@ Parses the fixed ASN.1 DER layout of SubjectPublicKeyInfo for RSA keys.
 import argparse
 import base64
 import json
+import re
 import sys
+
+_KMS_ARN_RE = re.compile(r"^arn:aws:kms:[^:]+:\d+:key/(.+)$")
+
+
+def extract_kms_key_id(key_id):
+    """Extract the key UUID from a KMS key ARN, or return as-is if not an ARN."""
+    m = _KMS_ARN_RE.match(key_id)
+    return m.group(1) if m else key_id
 
 
 def _read_der_length(data, offset):
@@ -115,7 +124,7 @@ def main():
                 "kty": "RSA",
                 "alg": "RS256",
                 "use": "sig",
-                "kid": args.key_id,
+                "kid": extract_kms_key_id(args.key_id),
                 "n": base64url_encode(n_bytes),
                 "e": base64url_encode(e_bytes),
             }
