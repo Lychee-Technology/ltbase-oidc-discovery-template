@@ -19,7 +19,7 @@ concurrency:
 
 jobs:
   publish:
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: ubuntu-latest
     env:
       DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
       PAGES_DEPLOY_BRANCH: ${{ vars.OIDC_DISCOVERY_PAGES_BRANCH || github.event.repository.default_branch }}
