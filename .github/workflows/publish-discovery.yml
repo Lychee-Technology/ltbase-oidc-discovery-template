@@ -40,11 +40,17 @@ jobs:
         id: commit_discovery
         env:
           OIDC_DISCOVERY_OUTPUT_DIR: ${{ runner.temp }}/discovery-output
+          TARGET_STACK: ${{ inputs.target_stack }}
         run: |
           set -euo pipefail
 
           output_dir="${OIDC_DISCOVERY_OUTPUT_DIR}"
-          rm -f "${RUNNER_TEMP}/oidc-current-stack-dirs.txt" "${RUNNER_TEMP}/oidc-removed-stack-dirs.txt"
+          current_manifest="${RUNNER_TEMP}/oidc-current-stack-dirs.txt"
+          removed_manifest="${RUNNER_TEMP}/oidc-removed-stack-dirs.txt"
+          rm -f "${current_manifest}" "${removed_manifest}"
+          # Ensure manifests exist so later reads never fail under set -e.
+          : > "${current_manifest}"
+          : > "${removed_manifest}"
 
           # Build current-stack manifest from output dir.
           shopt -s nullglob
@@ -52,33 +58,36 @@ jobs:
             stack_dir=${stack_dir%/}
             stack_name="${stack_dir##*/}"
             if [[ -f "${stack_dir}/.well-known/openid-configuration" && -f "${stack_dir}/.well-known/jwks.json" ]]; then
-              printf '%s\n' "${stack_name}" >> "${RUNNER_TEMP}/oidc-current-stack-dirs.txt"
+              printf '%s\n' "${stack_name}" >> "${current_manifest}"
             fi
           done
           shopt -u nullglob
 
-          # Detect removed stacks: dirs in repo root with .well-known content not in current manifest.
-          declare -A current_set=()
-          while IFS= read -r s; do
-            [[ -n "${s}" ]] && current_set["${s}"]=1
-          done < "${RUNNER_TEMP}/oidc-current-stack-dirs.txt" 2>/dev/null || true
+          # Detect removed stacks only on a full publish. A single-stack publish
+          # must leave other committed stacks untouched.
+          if [[ "${TARGET_STACK:-all}" == "all" ]]; then
+            declare -A current_set=()
+            while IFS= read -r s; do
+              [[ -n "${s}" ]] && current_set["${s}"]=1
+            done < "${current_manifest}"
 
-          shopt -s nullglob
-          for stack_dir in */; do
-            stack_dir=${stack_dir%/}
-            if [[ -f "${stack_dir}/.well-known/openid-configuration" && -f "${stack_dir}/.well-known/jwks.json" ]] && [[ -z "${current_set["${stack_dir}"]+x}" ]]; then
-              rm -rf "${stack_dir}"
-              printf '%s\n' "${stack_dir}" >> "${RUNNER_TEMP}/oidc-removed-stack-dirs.txt"
-              echo "Removed stale stack: ${stack_dir}"
-            fi
-          done
-          shopt -u nullglob
+            shopt -s nullglob
+            for stack_dir in */; do
+              stack_dir=${stack_dir%/}
+              if [[ -f "${stack_dir}/.well-known/openid-configuration" && -f "${stack_dir}/.well-known/jwks.json" ]] && [[ -z "${current_set["${stack_dir}"]+x}" ]]; then
+                rm -rf "${stack_dir}"
+                printf '%s\n' "${stack_dir}" >> "${removed_manifest}"
+                echo "Removed stale stack: ${stack_dir}"
+              fi
+            done
+            shopt -u nullglob
+          fi
 
           # Copy generated files from output dir to repo root.
           while IFS= read -r stack_dir; do
             [[ -n "${stack_dir}" ]] || continue
             rsync -a --delete "${output_dir}/${stack_dir}/" "${stack_dir}/"
-          done < "${RUNNER_TEMP}/oidc-current-stack-dirs.txt" 2>/dev/null || true
+          done < "${current_manifest}"
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -86,12 +95,12 @@ jobs:
           while IFS= read -r stack_dir; do
             [[ -n "${stack_dir}" ]] || continue
             git add -A -- "${stack_dir}"
-          done < "${RUNNER_TEMP}/oidc-current-stack-dirs.txt" 2>/dev/null || true
+          done < "${current_manifest}"
 
           while IFS= read -r stack_dir; do
             [[ -n "${stack_dir}" ]] || continue
             git add -A -- "${stack_dir}"
-          done < "${RUNNER_TEMP}/oidc-removed-stack-dirs.txt" 2>/dev/null || true
+          done < "${removed_manifest}"
 
           if git diff --cached --quiet; then
             echo "No changes to commit"

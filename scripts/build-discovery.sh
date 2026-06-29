@@ -18,9 +18,9 @@ fail() {
 
 # --- validate required vars ---
 
-: "${OIDC_DISCOVERY_DOMAIN:?}"
-: "${OIDC_DISCOVERY_STACK_CONFIG:?}"
-: "${OIDC_DISCOVERY_OUTPUT_DIR:?}"
+[[ -n "${OIDC_DISCOVERY_DOMAIN:-}" ]]       || fail "OIDC_DISCOVERY_DOMAIN is not set"
+[[ -n "${OIDC_DISCOVERY_STACK_CONFIG:-}" ]] || fail "OIDC_DISCOVERY_STACK_CONFIG is not set"
+[[ -n "${OIDC_DISCOVERY_OUTPUT_DIR:-}" ]]   || fail "OIDC_DISCOVERY_OUTPUT_DIR is not set"
 
 if ! echo "${OIDC_DISCOVERY_STACK_CONFIG}" | jq -e 'type == "object"' >/dev/null 2>&1; then
   fail "OIDC_DISCOVERY_STACK_CONFIG must be a valid JSON object"
@@ -49,28 +49,12 @@ for stack in "${stacks[@]}"; do
   fi
 done
 
-# --- stale stack cleanup (all only) ---
-
-if [[ "${TARGET_STACK}" == "all" ]]; then
-  tmp_configured="$(mktemp)"
-  for stack in "${stacks[@]}"; do
-    printf '%s\n' "${stack}" >> "${tmp_configured}"
-  done
-
-  shopt -s nullglob
-  for stack_dir in "${OIDC_DISCOVERY_OUTPUT_DIR}"/*/; do
-    stack_dir=${stack_dir%/}
-    stack_name="${stack_dir##*/}"
-    if [[ -d "${stack_dir}/.well-known" ]] && ! grep -qFx "${stack_name}" "${tmp_configured}" 2>/dev/null; then
-      rm -rf "${stack_dir}"
-      echo "Removed stale stack: ${stack_name}"
-    fi
-  done
-  shopt -u nullglob
-  rm -f "${tmp_configured}"
-fi
-
 # --- generate per-stack documents ---
+#
+# This script is generation-only: it writes the configured stacks into a fresh
+# output dir. Reconciling repo state (pruning stacks that are no longer
+# configured) is the publishing workflow's responsibility, since only the
+# workflow has the committed repo to compare against.
 
 mkdir -p "${OIDC_DISCOVERY_OUTPUT_DIR}"
 
@@ -101,9 +85,10 @@ for stack in "${stacks[@]}"; do
     --duration-seconds 900 \
     --output json) || fail "Failed to assume role ${aws_role_arn}"
 
-  export AWS_ACCESS_KEY_ID=$(echo "${creds}" | jq -r '.Credentials.AccessKeyId')
-  export AWS_SECRET_ACCESS_KEY=$(echo "${creds}" | jq -r '.Credentials.SecretAccessKey')
-  export AWS_SESSION_TOKEN=$(echo "${creds}" | jq -r '.Credentials.SessionToken')
+  # Split assignment from export so set -e catches a failed jq.
+  AWS_ACCESS_KEY_ID=$(echo "${creds}" | jq -r '.Credentials.AccessKeyId'); export AWS_ACCESS_KEY_ID
+  AWS_SECRET_ACCESS_KEY=$(echo "${creds}" | jq -r '.Credentials.SecretAccessKey'); export AWS_SECRET_ACCESS_KEY
+  AWS_SESSION_TOKEN=$(echo "${creds}" | jq -r '.Credentials.SessionToken'); export AWS_SESSION_TOKEN
   export AWS_DEFAULT_REGION="${aws_region}"
 
   # Fetch the RSA public key from KMS.

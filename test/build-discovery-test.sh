@@ -149,22 +149,21 @@ assert_dir_contains "${output_dir}" "devo/.well-known/jwks.json"
 assert_dir_contains "${output_dir}" "devo/.well-known/openid-configuration"
 assert_dir_not_contains "${output_dir}" "prod"
 
-# ---------- Test 3: stale stack cleanup ----------
+# ---------- Test 3: generation-only (does not prune unrelated content) ----------
+# The script is generation-only; pruning stale stacks is the workflow's job.
+# A pre-existing dir not in the config must be left untouched.
 
-output_dir="${temp_dir}/stale-stack"
+output_dir="${temp_dir}/generation-only"
 mkdir -p "${output_dir}"
 mkdir -p "${output_dir}/stale/.well-known"
 : > "${output_dir}/stale/.well-known/jwks.json"
 : > "${output_dir}/stale/.well-known/openid-configuration"
-mkdir -p "${output_dir}/devo/.well-known"
-: > "${output_dir}/devo/.well-known/jwks.json"
-: > "${output_dir}/devo/.well-known/openid-configuration"
 
 if ! run_build "${output_dir}" "all"; then
-  fail "expected build with stale cleanup to succeed"
+  fail "expected build to succeed"
 fi
 
-assert_dir_not_contains "${output_dir}" "stale"
+assert_dir_contains "${output_dir}" "stale/.well-known/jwks.json"
 assert_dir_contains "${output_dir}" "devo/.well-known/jwks.json"
 assert_dir_contains "${output_dir}" "prod/.well-known/jwks.json"
 
