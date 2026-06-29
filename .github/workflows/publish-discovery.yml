@@ -33,141 +33,61 @@ jobs:
           OIDC_DISCOVERY_DOMAIN: ${{ vars.OIDC_DISCOVERY_DOMAIN }}
           OIDC_DISCOVERY_STACK_CONFIG: ${{ vars.OIDC_DISCOVERY_STACK_CONFIG }}
           TARGET_STACK: ${{ inputs.target_stack }}
+          OIDC_DISCOVERY_OUTPUT_DIR: ${{ runner.temp }}/discovery-output
+        run: scripts/build-discovery.sh
+
+      - name: Commit discovery docs
+        id: commit_discovery
+        env:
+          OIDC_DISCOVERY_OUTPUT_DIR: ${{ runner.temp }}/discovery-output
+          TARGET_STACK: ${{ inputs.target_stack }}
         run: |
           set -euo pipefail
 
-          current_stack_manifest="${RUNNER_TEMP}/oidc-current-stack-dirs.txt"
-          removed_stack_manifest="${RUNNER_TEMP}/oidc-removed-stack-dirs.txt"
-          : > "${current_stack_manifest}"
-          : > "${removed_stack_manifest}"
+          output_dir="${OIDC_DISCOVERY_OUTPUT_DIR}"
+          current_manifest="${RUNNER_TEMP}/oidc-current-stack-dirs.txt"
+          removed_manifest="${RUNNER_TEMP}/oidc-removed-stack-dirs.txt"
+          rm -f "${current_manifest}" "${removed_manifest}"
+          # Ensure manifests exist so later reads never fail under set -e.
+          : > "${current_manifest}"
+          : > "${removed_manifest}"
 
-          if [[ -z "${OIDC_DISCOVERY_DOMAIN}" ]]; then
-            echo "::error::OIDC_DISCOVERY_DOMAIN repo variable is not set"
-            exit 1
-          fi
-          if [[ -z "${OIDC_DISCOVERY_STACK_CONFIG}" ]]; then
-            echo "::error::OIDC_DISCOVERY_STACK_CONFIG repo variable is not set"
-            exit 1
-          fi
-          if ! echo "${OIDC_DISCOVERY_STACK_CONFIG}" | jq -e 'type == "object"' >/dev/null; then
-            echo "::error::OIDC_DISCOVERY_STACK_CONFIG must be a valid JSON object"
-            exit 1
-          fi
-
-          # Determine which stacks to process
-          if [[ "${TARGET_STACK}" == "all" ]]; then
-            mapfile -t stacks < <(echo "${OIDC_DISCOVERY_STACK_CONFIG}" | jq -r 'keys[]')
-          else
-            if ! echo "${OIDC_DISCOVERY_STACK_CONFIG}" | jq -e --arg s "${TARGET_STACK}" '.[$s]' >/dev/null 2>&1; then
-              echo "::error::Stack '${TARGET_STACK}' not found in OIDC_DISCOVERY_STACK_CONFIG"
-              exit 1
-            fi
-            stacks=("${TARGET_STACK}")
-          fi
-
-          for stack in "${stacks[@]}"; do
-            if [[ ! "${stack}" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
-              echo "::error::Invalid stack name '${stack}' in OIDC_DISCOVERY_STACK_CONFIG"
-              exit 1
+          # Build current-stack manifest from output dir.
+          shopt -s nullglob
+          for stack_dir in "${output_dir}"/*/; do
+            stack_dir=${stack_dir%/}
+            stack_name="${stack_dir##*/}"
+            if [[ -f "${stack_dir}/.well-known/openid-configuration" && -f "${stack_dir}/.well-known/jwks.json" ]]; then
+              printf '%s\n' "${stack_name}" >> "${current_manifest}"
             fi
           done
+          shopt -u nullglob
 
-          if [[ "${TARGET_STACK}" == "all" ]]; then
-            declare -A configured_stacks=()
-            for stack in "${stacks[@]}"; do
-              configured_stacks["${stack}"]=1
-            done
+          # Detect removed stacks only on a full publish. A single-stack publish
+          # must leave other committed stacks untouched.
+          if [[ "${TARGET_STACK:-all}" == "all" ]]; then
+            declare -A current_set=()
+            while IFS= read -r s; do
+              [[ -n "${s}" ]] && current_set["${s}"]=1
+            done < "${current_manifest}"
 
             shopt -s nullglob
             for stack_dir in */; do
               stack_dir=${stack_dir%/}
-              if [[ -f "${stack_dir}/.well-known/openid-configuration" && -f "${stack_dir}/.well-known/jwks.json" ]] && [[ -z "${configured_stacks["${stack_dir}"]+x}" ]]; then
+              if [[ -f "${stack_dir}/.well-known/openid-configuration" && -f "${stack_dir}/.well-known/jwks.json" ]] && [[ -z "${current_set["${stack_dir}"]+x}" ]]; then
                 rm -rf "${stack_dir}"
-                printf '%s\n' "${stack_dir}" >> "${removed_stack_manifest}"
+                printf '%s\n' "${stack_dir}" >> "${removed_manifest}"
                 echo "Removed stale stack: ${stack_dir}"
               fi
             done
+            shopt -u nullglob
           fi
 
-          for stack in "${stacks[@]}"; do
-            echo "::group::${stack}"
-
-            aws_region=$(echo "${OIDC_DISCOVERY_STACK_CONFIG}" | jq -r --arg s "${stack}" '.[$s].aws_region')
-            aws_role_arn=$(echo "${OIDC_DISCOVERY_STACK_CONFIG}" | jq -r --arg s "${stack}" '.[$s].aws_role_arn')
-            kms_alias=$(echo "${OIDC_DISCOVERY_STACK_CONFIG}" | jq -r --arg s "${stack}" '.[$s].kms_auth_key_alias')
-
-            # Request a fresh GitHub OIDC token for each AWS STS exchange
-            oidc_response=$(curl -sS -f \
-              -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
-              "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com")
-            oidc_token=$(echo "${oidc_response}" | jq -r '.value')
-            if [[ -z "${oidc_token}" || "${oidc_token}" == "null" ]]; then
-              echo "::error::Failed to obtain GitHub OIDC token"
-              exit 1
-            fi
-
-            # Assume the stack's IAM role via OIDC federation
-            creds=$(AWS_DEFAULT_REGION="${aws_region}" aws sts assume-role-with-web-identity \
-              --role-arn "${aws_role_arn}" \
-              --role-session-name "oidc-discovery-${stack}" \
-              --web-identity-token "${oidc_token}" \
-              --duration-seconds 900 \
-              --output json)
-
-            export AWS_ACCESS_KEY_ID=$(echo "${creds}" | jq -r '.Credentials.AccessKeyId')
-            export AWS_SECRET_ACCESS_KEY=$(echo "${creds}" | jq -r '.Credentials.SecretAccessKey')
-            export AWS_SESSION_TOKEN=$(echo "${creds}" | jq -r '.Credentials.SessionToken')
-            export AWS_DEFAULT_REGION="${aws_region}"
-
-            # Fetch the RSA public key from KMS
-            public_key_json=$(aws kms get-public-key --key-id "${kms_alias}" --output json)
-            public_key_b64=$(echo "${public_key_json}" | jq -r '.PublicKey')
-            key_id=$(echo "${public_key_json}" | jq -r '.KeyId')
-
-            # Generate JWKS
-            mkdir -p "${stack}/.well-known"
-            python3 scripts/generate-jwks.py \
-              --public-key-b64 "${public_key_b64}" \
-              --key-id "${key_id}" \
-              > "${stack}/.well-known/jwks.json"
-
-            # Generate openid-configuration
-            python3 -c "
-          import json, sys
-          domain = sys.argv[1]
-          stack = sys.argv[2]
-          print(json.dumps({
-              'issuer': f'https://{domain}/{stack}',
-              'jwks_uri': f'https://{domain}/{stack}/.well-known/jwks.json',
-              'response_types_supported': ['id_token'],
-              'subject_types_supported': ['public'],
-              'id_token_signing_alg_values_supported': ['RS256'],
-          }, indent=2))" "${OIDC_DISCOVERY_DOMAIN}" "${stack}" \
-              > "${stack}/.well-known/openid-configuration"
-
-            echo "Published: ${stack}/.well-known/jwks.json"
-            echo "Published: ${stack}/.well-known/openid-configuration"
-
-            # Clear credentials before next iteration
-            unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_DEFAULT_REGION
-
-            echo "::endgroup::"
-          done
-
-          shopt -s nullglob
-          for stack_dir in */; do
-            stack_dir=${stack_dir%/}
-            if [[ -f "${stack_dir}/.well-known/openid-configuration" && -f "${stack_dir}/.well-known/jwks.json" ]]; then
-              printf '%s\n' "${stack_dir}" >> "${current_stack_manifest}"
-            fi
-          done
-
-      - name: Commit discovery docs
-        id: commit_discovery
-        run: |
-          set -euo pipefail
-          current_stack_manifest="${RUNNER_TEMP}/oidc-current-stack-dirs.txt"
-          removed_stack_manifest="${RUNNER_TEMP}/oidc-removed-stack-dirs.txt"
+          # Copy generated files from output dir to repo root.
+          while IFS= read -r stack_dir; do
+            [[ -n "${stack_dir}" ]] || continue
+            rsync -a --delete "${output_dir}/${stack_dir}/" "${stack_dir}/"
+          done < "${current_manifest}"
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -175,12 +95,12 @@ jobs:
           while IFS= read -r stack_dir; do
             [[ -n "${stack_dir}" ]] || continue
             git add -A -- "${stack_dir}"
-          done < "${current_stack_manifest}"
+          done < "${current_manifest}"
 
           while IFS= read -r stack_dir; do
             [[ -n "${stack_dir}" ]] || continue
             git add -A -- "${stack_dir}"
-          done < "${removed_stack_manifest}"
+          done < "${removed_manifest}"
 
           if git diff --cached --quiet; then
             echo "No changes to commit"
@@ -204,12 +124,11 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
           OIDC_DISCOVERY_PAGES_PROJECT: ${{ vars.OIDC_DISCOVERY_PAGES_PROJECT }}
+          OIDC_DISCOVERY_OUTPUT_DIR: ${{ runner.temp }}/discovery-output
         run: |
           set -euo pipefail
 
-          current_stack_manifest="${RUNNER_TEMP}/oidc-current-stack-dirs.txt"
-          removed_stack_manifest="${RUNNER_TEMP}/oidc-removed-stack-dirs.txt"
-          site_dir=$(mktemp -d)
+          output_dir="${OIDC_DISCOVERY_OUTPUT_DIR}"
 
           if [[ -z "${CLOUDFLARE_API_TOKEN}" ]]; then
             echo "::error::CLOUDFLARE_API_TOKEN repo secret is not set"
@@ -224,24 +143,19 @@ jobs:
             exit 1
           fi
 
-          while IFS= read -r stack_dir; do
-            [[ -n "${stack_dir}" ]] || continue
-            cp -R "${stack_dir}" "${site_dir}/"
-          done < "${current_stack_manifest}"
-
-          if [[ -s "${current_stack_manifest}" ]]; then
-            headers_file="${site_dir}/_headers"
-            : > "${headers_file}"
-            while IFS= read -r stack_dir; do
-              [[ -n "${stack_dir}" ]] || continue
-              printf '/%s/.well-known/openid-configuration\n  Content-Type: application/json; charset=utf-8\n\n/%s/.well-known/jwks.json\n  Content-Type: application/json; charset=utf-8\n\n' "${stack_dir}" "${stack_dir}" >> "${headers_file}"
-            done < "${current_stack_manifest}"
-          fi
-
-          if [[ ! -s "${current_stack_manifest}" && -s "${removed_stack_manifest}" ]]; then
-            placeholder_file="${site_dir}/.pages-placeholder"
-            : > "${placeholder_file}"
-          fi
+          # Build site dir from output dir (excluding _headers which wrangler handles).
+          site_dir=$(mktemp -d)
+          shopt -s nullglob
+          for item in "${output_dir}"/*/; do
+            item=${item%/}
+            cp -R "${item}" "${site_dir}/"
+          done
+          for item in "${output_dir}"/_headers; do
+            if [[ -f "${item}" ]]; then
+              cp "${item}" "${site_dir}/"
+            fi
+          done
+          shopt -u nullglob
 
           if [[ -z "$(ls -A "${site_dir}")" ]]; then
             echo "::error::No generated stack content found to deploy"
